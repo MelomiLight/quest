@@ -411,3 +411,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 28px;
 .lu-card span { opacity: .8; }
 @keyframes pop { from { transform: scale(.4); opacity: 0; } }
 @keyframes fade { from { opacity: 0; } }
+
+.tree-chips .chip { text-align: left; }
+.tree-chips .chip .i { color: var(--accent); }
+.plan-ai { margin-top: 14px; }

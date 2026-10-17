@@ -670,13 +670,64 @@ function defaultSprintStart() {
   return S.sprints.some(s => s.start === mon) ? addDays(mon, 7) : mon;
 }
 
+const nodeLabel = id => {
+  const n = TREE_NODES.find(x => x.id === id);
+  return n ? `${TREE.find(b => b.id === n.branch).name}: ${n.name}` : '';
+};
+
+// The next unstudied topic of every branch, in roadmap order — variety without decision fatigue
+function nextTopics(exclude = new Set()) {
+  const lcc = lcByTopic();
+  const out = [];
+  for (const b of TREE) {
+    if (b.auto) continue;
+    const n = TREE_NODES.find(x => x.branch === b.id && !exclude.has(x.id) && !nodeStars(x, lcc).s);
+    if (n) out.push(n.id);
+  }
+  return out;
+}
+
+const cleanGoal = g => {
+  const type = GOAL_TYPES[g.type] ? g.type : 'topic';
+  const node = type === 'topic' && TREE_NODES.some(n => n.id === g.node && !n.auto) ? g.node : undefined;
+  return { id: uid(), type, text: (g.text || '').trim() || (node ? nodeLabel(node) : ''), target: +g.target || 12, done: false, node };
+};
+
+function planContext() {
+  const tp = treeProgress();
+  const lcc = lcByTopic();
+  const recent = Object.keys(S.days).sort().slice(-14).map(d => S.days[d]);
+  const avg = k => { const v = recent.map(e => e[k]).filter(x => x != null && x !== ''); return v.length ? +(v.reduce((a, b) => a + +b, 0) / v.length).toFixed(1) : null; };
+  const candidates = [];
+  for (const b of TREE) {
+    if (b.auto) continue;
+    TREE_NODES.filter(x => x.branch === b.id && !nodeStars(x, lcc).s).slice(0, 3).forEach(x => candidates.push({ id: x.id, topic: nodeLabel(x.id) }));
+  }
+  return {
+    goal: S.profile.goal,
+    deadline: S.profile.deadline,
+    days_left: dayDiff(today(), S.profile.deadline),
+    readiness_pct: Math.round(tp.pct * 100),
+    branches: TREE.map(b => `${b.name}: ${tp.byBranch[b.id].stars}/${tp.byBranch[b.id].max} звёзд`),
+    candidate_topics: candidates,
+    leetcode_solved_by_pattern: Object.fromEntries(LC_TOPICS.map(([k, n]) => [`${k} (${n})`, lcc[k] || 0])),
+    previous_sprints: S.sprints.filter(s => s.closed).sort((a, b) => b.n - a.n).slice(0, 3)
+      .map(s => ({ n: s.n, plan_vs_fact: s.goals.map(g => `${g.text}: ${goalMark(s, g)}`), conclusion: s.retro?.conclusion || '' })),
+    diary_last_14_days: recent.length ? {
+      entries: recent.length, avg_rating: avg('rating'), avg_sleep: avg('sleep'),
+      days_went_outside: recent.filter(e => e.acts?.outside).length,
+      days_gym: recent.filter(e => e.acts?.gym).length,
+    } : 'дневник пока пуст',
+  };
+}
+
 function openPlanner(id, pre) {
   const ex = id ? S.sprints.find(s => s.id === id) : null;
   const last = lastSprint();
   const sp = ex ? clone(ex) : {
     n: last ? last.n + 1 : S.profile.nextSprint,
     start: pre?.start || (last && !last.closed ? addDays(last.start, 7) : defaultSprintStart()),
-    goals: pre?.goals?.length ? pre.goals.map(g => ({ id: uid(), type: GOAL_TYPES[g.type] ? g.type : 'topic', text: g.text || '', target: +g.target || 12, done: false }))
+    goals: pre?.goals?.length ? pre.goals.map(cleanGoal)
       : [{ id: uid(), type: 'topic', text: '' }, { id: uid(), type: 'lc', text: 'LeetCode', target: 12 }, { id: uid(), type: 'feynman', text: '' }, { id: uid(), type: 'life', text: '' }],
   };
   const sh = openSheet(`
@@ -684,9 +735,13 @@ function openPlanner(id, pre) {
     ${pre?.goals?.length ? `<p class="note ai-note">${icon('wand-sparkles')} План предложил ИИ-коуч — поправь под себя</p>` : ''}
     <div class="field"><span>Номер спринта</span><input id="p-n" inputmode="numeric" value="${sp.n}"></div>
     <div class="field"><span>Начало (понедельник)</span><input type="date" id="p-start" value="${sp.start}"></div>
+    ${AI.ready ? `<button type="button" class="btn ai wide plan-ai" id="p-ai">${icon('wand-sparkles')} Предложить план с ИИ</button>
+      <p class="note ai-note" id="p-why" hidden></p>` : '<p class="note">Добавь ключ OpenAI в настройках — ИИ сможет предлагать план спринта.</p>'}
     <div class="label">Цели = урон по боссу</div>
     <div id="p-goals"></div>
     <div class="add-goals">${Object.entries(GOAL_TYPES).map(([k, g]) => `<button type="button" class="chip" data-add="${k}">${icon(g.icon)} ${g.name}</button>`).join('')}</div>
+    <div class="label">Следующие темы из дерева</div>
+    <div class="chips tree-chips" id="p-tree"></div>
     <p class="note">Тема — 30 HP, LeetCode — 40, Фейнман — 20, Жизнь — 10. Фейнман засчитается сам, как только появится пост на этой неделе; LeetCode считается по решённым задачам.</p>
     <div class="actions">
       ${ex ? `<button class="btn danger" id="p-del" aria-label="Удалить">${icon('trash-2')}</button>` : ''}
@@ -700,21 +755,48 @@ function openPlanner(id, pre) {
   });
   const paint = () => {
     $('#p-goals', sh).innerHTML = sp.goals.map(g => `<div class="pg" data-g="${g.id}">
-      <span class="pg-ic">${icon(GOAL_TYPES[g.type].icon)}</span>
+      <span class="pg-ic" ${g.node ? 'title="Тема из дерева"' : ''}>${icon(g.node ? 'network' : GOAL_TYPES[g.type].icon)}</span>
       <input class="pg-text" placeholder="${ph[g.type]}" value="${esc(g.text)}" autocomplete="off" enterkeyhint="done">
       ${g.type === 'lc' ? `<input class="pg-target" inputmode="numeric" value="${g.target || 12}" aria-label="Сколько задач">` : ''}
       <button type="button" class="icon-btn" data-rm="${g.id}" aria-label="Убрать">${icon('x')}</button>
     </div>`).join('');
+    const picked = new Set(sp.goals.map(g => g.node).filter(Boolean));
+    const next = nextTopics(picked);
+    $('#p-tree', sh).innerHTML = next.length
+      ? next.map(nid => `<button type="button" class="chip" data-node="${nid}">${icon('plus')} ${esc(nodeLabel(nid))}</button>`).join('')
+      : '<span class="note">Все темы дерева изучены 🎉</span>';
   };
   paint();
   sh.addEventListener('click', e => {
     const add = e.target.closest('[data-add]');
     const rm = e.target.closest('[data-rm]');
-    if (!add && !rm) return;
+    const nd = e.target.closest('[data-node]');
+    if (!add && !rm && !nd) return;
     readGoals();
     if (add) sp.goals.push({ id: uid(), type: add.dataset.add, text: '', target: 12 });
     if (rm) sp.goals = sp.goals.filter(g => g.id !== rm.dataset.rm);
+    if (nd) {
+      // fill an empty topic slot first, otherwise add a new goal
+      const empty = sp.goals.find(g => g.type === 'topic' && !g.text && !g.node);
+      if (empty) Object.assign(empty, { text: nodeLabel(nd.dataset.node), node: nd.dataset.node });
+      else sp.goals.splice(sp.goals.filter(g => g.type === 'topic').length, 0, { id: uid(), type: 'topic', text: nodeLabel(nd.dataset.node), node: nd.dataset.node });
+    }
     paint();
+  });
+  $('#p-ai', sh)?.addEventListener('click', async ev => {
+    const btn = ev.currentTarget;
+    busy(btn, true);
+    try {
+      const r = await AI.plan(planContext());
+      const goals = (r.plan || []).map(cleanGoal).filter(g => g.text || g.type === 'lc');
+      if (!goals.length) throw new Error('ИИ не предложил целей, попробуй ещё раз');
+      sp.goals = goals;
+      paint();
+      const why = $('#p-why', sh);
+      why.innerHTML = `${icon('wand-sparkles')} ${esc(r.why || 'План предложил ИИ — поправь под себя')}`;
+      why.hidden = false;
+    } catch (err) { toast(err.message); }
+    busy(btn, false);
   });
   $('#p-save', sh).onclick = () => {
     readGoals();
@@ -738,7 +820,11 @@ function toggleGoal(spId, gId) {
   const g = sp?.goals.find(x => x.id === gId);
   if (!g || sp.closed) return;
   if (g.type === 'feynman' && goalProgress(sp, { ...g, done: false }).val) return toast('Засчитано автоматически — есть пост Фейнмана');
-  commit(() => { g.done = !g.done; }, g.done ? 'Цель снова открыта' : `Удар по боссу: −${GOAL_TYPES[g.type].weight} HP`);
+  const star = !g.done && g.node && !(S.tree[g.node] || {}).s;
+  commit(() => {
+    g.done = !g.done;
+    if (star) S.tree[g.node] = { ...(S.tree[g.node] || {}), s: true };
+  }, g.done ? 'Цель снова открыта' : `Удар по боссу: −${GOAL_TYPES[g.type].weight} HP${star ? ' · ⭐ тема изучена' : ''}`);
 }
 
 function weekStats(sp) {
@@ -818,6 +904,7 @@ function openRetro(id) {
         }),
         spheres: sphereLine,
         previous_sprints: prevSprints,
+        candidate_topics: planContext().candidate_topics,
       };
       const res = await AI.retro(ctx);
       if (res.hindered) $('#r-h', sh).value = res.hindered;
